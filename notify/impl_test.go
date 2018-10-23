@@ -18,6 +18,8 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -204,8 +206,8 @@ func defaultRetryCodes() []int {
 	}
 }
 
-func createTmpl(t *testing.T) *template.Template {
-	tmpl, err := template.FromGlobs()
+func createTmpl(t *testing.T, paths ...string) *template.Template {
+	tmpl, err := template.FromGlobs(paths...)
 	require.NoError(t, err)
 	tmpl.ExternalURL, _ = url.Parse("http://am")
 	return tmpl
@@ -218,12 +220,28 @@ func readBody(t *testing.T, r *http.Request) string {
 }
 
 func TestOpsGenie(t *testing.T) {
+	templateDir, err := ioutil.TempDir("", "opsgenie-")
+	if err != nil {
+		t.Fatalf("failed to create temporary directory: %v", err)
+	}
+	templateDir, err = filepath.Abs(templateDir)
+	if err != nil {
+		t.Fatalf("failed to get absolute path to temporary directory: %v", err)
+	}
+
+	defer os.RemoveAll(templateDir)
+
+	templateString := "{{ define \"opsgenie-apikey\" }}s3cr3t{{ end }}"
+	if err = ioutil.WriteFile(filepath.Join(templateDir, "template.tmpl"), []byte(templateString), 0644); err != nil {
+		t.Fatalf("failed to create template file: %v", err)
+	}
+
 	u, err := url.Parse("https://opsgenie/api")
 	if err != nil {
 		t.Fatalf("failed to parse URL: %v", err)
 	}
 	logger := log.NewNopLogger()
-	tmpl := createTmpl(t)
+	tmpl := createTmpl(t, filepath.Join(templateDir, "*"))
 	conf := &config.OpsGenieConfig{
 		NotifierConfig: config.NotifierConfig{
 			VSendResolved: true,
@@ -235,7 +253,7 @@ func TestOpsGenie(t *testing.T) {
 		Tags:        `{{ .CommonLabels.Tags }}`,
 		Note:        `{{ .CommonLabels.Note }}`,
 		Priority:    `{{ .CommonLabels.Priority }}`,
-		APIKey:      `s3cr3t`,
+		APIKey:      `{{ template "opsgenie-apikey" }}`,
 		APIURL:      &config.URL{u},
 	}
 	notifier := NewOpsGenie(conf, tmpl, logger)
@@ -283,4 +301,10 @@ func TestOpsGenie(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, true, retry)
 	require.Equal(t, expectedBody, readBody(t, req))
+
+	// Broken API Key Template.
+	conf.APIKey = "{{ kaput "
+	_, _, err = notifier.createRequest(ctx, alert2)
+	require.Error(t, err)
+	require.Equal(t, err.Error(), "templating error: template: :1: function \"kaput\" not defined")
 }
